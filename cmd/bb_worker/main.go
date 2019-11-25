@@ -35,6 +35,7 @@ func main() {
 	// closed off, or creates files with the appropriate mode to be
 	// secure.
 	syscall.Umask(0)
+	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 128
 
 	if len(os.Args) != 2 {
 		log.Fatal("Usage: bb_worker bb_worker.jsonnet")

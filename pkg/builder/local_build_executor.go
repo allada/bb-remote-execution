@@ -7,6 +7,9 @@ import (
 	"path"
 	"strings"
 	"time"
+	"sync"
+	"sync/atomic"
+	"fmt"
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/buildbarn/bb-remote-execution/pkg/environment"
@@ -35,6 +38,8 @@ var (
 	localBuildExecutorDurationSecondsGetActionCommand  = localBuildExecutorDurationSeconds.WithLabelValues("GetActionCommand")
 	localBuildExecutorDurationSecondsRunCommand        = localBuildExecutorDurationSeconds.WithLabelValues("RunCommand")
 	localBuildExecutorDurationSecondsUploadOutput      = localBuildExecutorDurationSeconds.WithLabelValues("UploadOutput")
+	MAX_CONCURRENT_DOWNLOADS                           = 128
+	MAX_DOWNLOAD_FILE_RETRIES                          = 3
 )
 
 func init() {
@@ -44,64 +49,155 @@ func init() {
 type localBuildExecutor struct {
 	contentAddressableStorage cas.ContentAddressableStorage
 	environmentManager        environment.Manager
+	workChan                  chan func()
+}
+
+type workspaceBuilder struct {
+	ctx context.Context
+	contentAddressableStorage cas.ContentAddressableStorage
+	errorCounter uint32
+	errorMsg atomic.Value // Always error type.
+	workChan chan func()
+}
+
+func NewWorkspaceBuilder(ctx context.Context, contentAddressableStorage cas.ContentAddressableStorage, workChan chan func()) *workspaceBuilder {
+	return &workspaceBuilder{
+		ctx: ctx,
+		contentAddressableStorage: contentAddressableStorage,
+		errorCounter: 0,
+		workChan: workChan,
+	}
+}
+
+func (wb *workspaceBuilder) GetError() error {
+	value := wb.errorMsg.Load()
+	if value == nil {
+		return nil
+	}
+	return value.(error)
+}
+
+func (wb *workspaceBuilder) setError(msg error) {
+	// Flag the builder to abort all other downloads and store the error result.
+	atomic.AddUint32(&wb.errorCounter, 1)
+	// Multiple errors may have happened here, but we only care about one of them (any of them).
+	wb.errorMsg.Store(msg)
+}
+
+func (wb *workspaceBuilder) enqueueWork(wg *sync.WaitGroup, work func(), debugName string) {
+	if (atomic.LoadUint32(&wb.errorCounter) != 0) {
+		// Looks like another download failed, so we don't want to continue any additional work.
+		return
+	}
+	wg.Add(1);
+	wb.workChan <-func() {
+		defer func() {
+			wg.Done()
+		}()
+		if (atomic.LoadUint32(&wb.errorCounter) != 0) {
+			// Looks like another download failed, so we don't want to continue any additional work.
+			return
+		}
+		work()
+	}
+}
+
+func (wb *workspaceBuilder) EnqueueGetDirectory(partialDigest *remoteexecution.Digest, parentDigest *util.Digest,
+                                                inputDirectory filesystem.Directory,
+                                                components []string) *sync.WaitGroup {
+	wg := sync.WaitGroup{}
+	// Make a copy of the slice because we might be mutating it later.
+	wb.enqueueWork(&wg, func() {
+		// Obtain directory.
+		digest, err := parentDigest.NewDerivedDigest(partialDigest)
+		if err != nil {
+			wb.setError(util.StatusWrapf(err, "Failed to extract digest for input directory %#v", path.Join(components...)))
+			return
+		}
+		directory, err := wb.contentAddressableStorage.GetDirectory(wb.ctx, digest)
+		if err != nil {
+			wb.setError(util.StatusWrapf(err, "Failed to obtain input directory %#v", path.Join(components...)))
+			return
+		}
+
+		// Create children.
+		for _, file := range directory.Files {
+			childComponents := append([]string{}, components...)  // Ensure we have a full copy because of our lambda.
+			childComponents = append(childComponents, file.Name)
+			childDigest, err := digest.NewDerivedDigest(file.Digest)
+			if err != nil {
+				wb.setError(util.StatusWrapf(err, "Failed to extract digest for input file %#v", path.Join(childComponents...)))
+				return
+			}
+			fileCopy := file  // `file` is a reference and will be replaced on every iteration.
+			wb.enqueueWork(&wg, func() {
+				var err error
+				for i := 0; i < MAX_DOWNLOAD_FILE_RETRIES; i++ {
+					if err = wb.contentAddressableStorage.GetFile(wb.ctx, childDigest, inputDirectory, fileCopy.Name, fileCopy.IsExecutable); err == nil {
+						return  // Success path.
+					}
+				}
+				wb.setError(util.StatusWrapf(err, "Failed to obtain input file %#v", path.Join(childComponents...)))
+			}, path.Join(childComponents...))
+		}
+		for _, directory := range directory.Directories {
+			childComponents := append([]string{}, components...)  // Ensure we have a full copy because of our lambda.
+			childComponents = append(childComponents, directory.Name)
+			if err := inputDirectory.Mkdir(directory.Name, 0777); err != nil {
+				wb.setError(util.StatusWrapf(err, "Failed to create input directory %#v", path.Join(childComponents...)))
+				return
+			}
+			childDirectory, err := inputDirectory.Enter(directory.Name)
+			if err != nil {
+				wb.setError(util.StatusWrapf(err, "Failed to enter input directory %#v", path.Join(childComponents...)))
+				return
+			}
+			wg.Add(1)  // Ensure parent directory will not close until our children are closed.
+			childWorkGroup := wb.EnqueueGetDirectory(directory.Digest, digest, childDirectory, childComponents)
+			go func() {
+				childWorkGroup.Wait()
+				childDirectory.Close()
+				wg.Done()
+			}()
+		}
+		for _, symlink := range directory.Symlinks {
+			// Gotcha: Symlinks are created, but the referenced objects may not be downloaded yet.
+			if err := inputDirectory.Symlink(symlink.Target, symlink.Name); err != nil {
+				childComponents := append(components, symlink.Name)
+				wb.setError(util.StatusWrapf(err, "Failed to create input symlink %#v", path.Join(childComponents...)))
+				return
+			}
+		}
+	}, path.Join(components...))
+	return &wg
 }
 
 // NewLocalBuildExecutor returns a BuildExecutor that executes build
 // steps on the local system.
-func NewLocalBuildExecutor(contentAddressableStorage cas.ContentAddressableStorage, environmentManager environment.Manager) BuildExecutor {
+func NewLocalBuildExecutor(contentAddressableStorage cas.ContentAddressableStorage,
+                           environmentManager environment.Manager) BuildExecutor {
+	workChan := make(chan func(), math.MaxInt32)
+	for i := 0;  i < MAX_CONCURRENT_DOWNLOADS; i++ {
+		go func () {
+			// This channel will contain all the download tasks, so we spin up MAX_CONCURRENT_DOWNLOADS go routines to
+			// read from the channel and process the tasks.  This will block the goroutine until work is available if
+			// no tasks are in the queue.
+			for {
+				download_task := <-workChan
+				download_task()
+			}
+		}()
+	}
 	return &localBuildExecutor{
 		contentAddressableStorage: contentAddressableStorage,
 		environmentManager:        environmentManager,
+		workChan:                  workChan,
 	}
 }
 
-func (be *localBuildExecutor) createInputDirectory(ctx context.Context, partialDigest *remoteexecution.Digest, parentDigest *util.Digest, inputDirectory filesystem.Directory, components []string) error {
-	// Obtain directory.
-	digest, err := parentDigest.NewDerivedDigest(partialDigest)
-	if err != nil {
-		return util.StatusWrapf(err, "Failed to extract digest for input directory %#v", path.Join(components...))
-	}
-	directory, err := be.contentAddressableStorage.GetDirectory(ctx, digest)
-	if err != nil {
-		return util.StatusWrapf(err, "Failed to obtain input directory %#v", path.Join(components...))
-	}
-
-	// Create children.
-	for _, file := range directory.Files {
-		childComponents := append(components, file.Name)
-		childDigest, err := digest.NewDerivedDigest(file.Digest)
-		if err != nil {
-			return util.StatusWrapf(err, "Failed to extract digest for input file %#v", path.Join(childComponents...))
-		}
-		if err := be.contentAddressableStorage.GetFile(ctx, childDigest, inputDirectory, file.Name, file.IsExecutable); err != nil {
-			return util.StatusWrapf(err, "Failed to obtain input file %#v", path.Join(childComponents...))
-		}
-	}
-	for _, directory := range directory.Directories {
-		childComponents := append(components, directory.Name)
-		if err := inputDirectory.Mkdir(directory.Name, 0777); err != nil {
-			return util.StatusWrapf(err, "Failed to create input directory %#v", path.Join(childComponents...))
-		}
-		childDirectory, err := inputDirectory.Enter(directory.Name)
-		if err != nil {
-			return util.StatusWrapf(err, "Failed to enter input directory %#v", path.Join(childComponents...))
-		}
-		err = be.createInputDirectory(ctx, directory.Digest, digest, childDirectory, childComponents)
-		childDirectory.Close()
-		if err != nil {
-			return err
-		}
-	}
-	for _, symlink := range directory.Symlinks {
-		childComponents := append(components, symlink.Name)
-		if err := inputDirectory.Symlink(symlink.Target, symlink.Name); err != nil {
-			return util.StatusWrapf(err, "Failed to create input symlink %#v", path.Join(childComponents...))
-		}
-	}
-	return nil
-}
-
-func (be *localBuildExecutor) uploadDirectory(ctx context.Context, outputDirectory filesystem.Directory, parentDigest *util.Digest, children map[string]*remoteexecution.Directory, components []string) (*remoteexecution.Directory, error) {
+func (be *localBuildExecutor) uploadDirectory(ctx context.Context, outputDirectory filesystem.Directory,
+																							parentDigest *util.Digest, children map[string]*remoteexecution.Directory,
+																							components []string) (*remoteexecution.Directory, error) {
 	files, err := outputDirectory.ReadDir()
 	if err != nil {
 		return nil, util.StatusWrapf(err, "Failed to read output directory %#v", path.Join(components...))
@@ -140,7 +236,8 @@ func (be *localBuildExecutor) uploadDirectory(ctx context.Context, outputDirecto
 			}
 			digestGenerator := parentDigest.NewDigestGenerator()
 			if _, err := digestGenerator.Write(data); err != nil {
-				return nil, util.StatusWrapf(err, "Failed to compute digest of output directory %#v", path.Join(childComponents...))
+				return nil, util.StatusWrapf(err, "Failed to compute digest of output directory %#v",
+																		 path.Join(childComponents...))
 			}
 			digest := digestGenerator.Sum()
 
@@ -165,7 +262,8 @@ func (be *localBuildExecutor) uploadDirectory(ctx context.Context, outputDirecto
 	return &directory, nil
 }
 
-func (be *localBuildExecutor) uploadTree(ctx context.Context, outputDirectory filesystem.Directory, parentDigest *util.Digest, components []string) (*util.Digest, error) {
+func (be *localBuildExecutor) uploadTree(ctx context.Context, outputDirectory filesystem.Directory,
+                                         parentDigest *util.Digest, components []string) (*util.Digest, error) {
 	// Gather all individual directory objects and turn them into a tree.
 	children := map[string]*remoteexecution.Directory{}
 	root, err := be.uploadDirectory(ctx, outputDirectory, parentDigest, children, components)
@@ -249,7 +347,11 @@ func (be *localBuildExecutor) Execute(ctx context.Context, request *remoteexecut
 
 	// Set up inputs.
 	buildDirectory := environment.GetBuildDirectory()
-	if err := be.createInputDirectory(ctx, action.InputRootDigest, actionDigest, buildDirectory, []string{"."}); err != nil {
+	workspaceBuilder := NewWorkspaceBuilder(ctx, be.contentAddressableStorage, be.workChan)
+	wg := workspaceBuilder.EnqueueGetDirectory(action.InputRootDigest, actionDigest, buildDirectory, []string{"."})
+	wg.Wait()
+	fmt.Println("Done and ready to execute")
+	if err := workspaceBuilder.GetError(); err != nil {
 		return convertErrorToExecuteResponse(err), false
 	}
 

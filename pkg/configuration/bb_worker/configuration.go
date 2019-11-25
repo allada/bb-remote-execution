@@ -23,13 +23,13 @@ func setDefaultWorkerValues(workerConfiguration *pb.WorkerConfiguration) {
 		workerConfiguration.CacheDirectoryPath = "/worker/cache"
 	}
 	if workerConfiguration.MaximumCacheFileCount == 0 {
-		workerConfiguration.MaximumCacheFileCount = 10000
+		workerConfiguration.MaximumCacheFileCount = 1000000
 	}
 	if workerConfiguration.MaximumCacheSizeBytes == 0 {
-		workerConfiguration.MaximumCacheSizeBytes = 1024 * 1024 * 1024
+		workerConfiguration.MaximumCacheSizeBytes = 32212254720 // 32g
 	}
 	if workerConfiguration.MaximumMemoryCachedDirectories == 0 {
-		workerConfiguration.MaximumMemoryCachedDirectories = 1000
+		workerConfiguration.MaximumMemoryCachedDirectories = 1000000
 	}
 	if workerConfiguration.Concurrency == 0 {
 		workerConfiguration.Concurrency = 1
