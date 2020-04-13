@@ -21,6 +21,7 @@ import (
 	runner_pb "github.com/buildbarn/bb-remote-execution/pkg/proto/runner"
 	"github.com/buildbarn/bb-remote-execution/pkg/runner"
 	"github.com/buildbarn/bb-remote-execution/pkg/sync"
+	re_util "github.com/buildbarn/bb-remote-execution/pkg/util"
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
 	blobstore_configuration "github.com/buildbarn/bb-storage/pkg/blobstore/configuration"
 	"github.com/buildbarn/bb-storage/pkg/cas"
@@ -74,6 +75,11 @@ func main() {
 		}
 		filePool = re_filesystem.NewDirectoryBackedFilePool(filePoolDirectory)
 	}
+
+	if configuration.SharedActionQueueSize < 1 {
+		log.Fatal("shared_action_queue_size must be set and greater than zero.")
+	}
+	sharedActionQueue := re_util.NewSharedActionQueue(configuration.SharedActionQueueSize)
 
 	// Storage access.
 	globalContentAddressableStorageBlobAccess, actionCache, err := blobstore_configuration.CreateBlobAccessObjectsFromConfig(
@@ -212,7 +218,9 @@ func main() {
 
 					buildDirectory := builder.NewNaiveBuildDirectory(
 						naiveBuildDirectory,
-						perThreadContentAddressableStorage)
+						perThreadContentAddressableStorage,
+						sharedActionQueue,
+					)
 
 					// Create a per-action subdirectory in
 					// the build directory named after the
