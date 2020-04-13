@@ -40,7 +40,7 @@ message ApplicationConfiguration {
   // The size of concurrent actions that can be run at any given time.
   // This many goroutines and concurrent streams will be allowed at
   // any given time.
-  uint32 shared_action_queue_size = 20;
+  uint32 shared_action_queue_size = 21;
 
   // Common configuration options that apply to all Buildbarn binaries.
   buildbarn.configuration.global.Configuration global = 19;

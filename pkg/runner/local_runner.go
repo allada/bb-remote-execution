@@ -70,7 +70,7 @@ func (r *localRunner) Run(ctx context.Context, request *runner.RunRequest) (*run
 	if len(request.Arguments) < 1 {
 		return nil, status.Error(codes.InvalidArgument, "Insufficient number of command arguments")
 	}
-	cmd := exec.CommandContext(ctx, request.Arguments[0], request.Arguments[1:]...)
+	cmd := exec.CommandContext(ctx, "/home/ubuntu/runner_wrapper.sh", request.Arguments...)
 	// TODO: Convert WorkingDirectory and TemporaryDirectory to use
 	// platform specific path delimiters.
 	cmd.Dir = filepath.Join(r.buildDirectoryPath, request.InputRootDirectory, request.WorkingDirectory)
