@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os/exec"
 	"sort"
 	"sync"
 	"time"
@@ -200,6 +201,23 @@ func NewInMemoryBuildQueue(contentAddressableStorage cas.ContentAddressableStora
 var _ builder.BuildQueue = (*InMemoryBuildQueue)(nil)
 var _ remoteworker.OperationQueueServer = (*InMemoryBuildQueue)(nil)
 var _ BuildQueueStateProvider = (*InMemoryBuildQueue)(nil)
+
+func shouldRetry(executeResponse *remoteexecution.ExecuteResponse) bool {
+	status := ""
+	if executeResponse.Status != nil {
+		status = executeResponse.Status.Message
+	}
+	exit_code := "1"
+	if executeResponse.Result != nil {
+		exit_code = fmt.Sprint(executeResponse.Result.ExitCode)
+	}
+	// fmt.Println(executeResponse.Status.Message)
+	cmd := exec.Command("/home/ubuntu/should_retry.sh", exit_code, status, executeResponse.Message)
+	if err := cmd.Run(); err != nil {
+		return true
+	}
+	return false
+}
 
 // GetCapabilities returns the Remote Execution protocol capabilities
 // that this service supports.
@@ -1182,12 +1200,23 @@ func (o *operation) complete(bq *InMemoryBuildQueue, executeResponse *remoteexec
 	pq := o.platformQueue
 	if o.queueIndex >= 0 {
 		heap.Remove(&pq.queuedOperations, o.queueIndex)
+		o.queueIndex = -1
 		o.registerQueuedStageFinished(bq)
 	}
 
 	// Move the operation to the completed stage if it's still in
 	// the executing stage.
 	if o.executeResponse == nil {
+		if shouldRetry(executeResponse) && o.retryCount <= bq.configuration.WorkerOperationRetryCount {
+			o.retryCount++
+			heap.Push(&pq.queuedOperations, queuedOperationsEntry{
+				priority:  math.MaxInt32,
+				operation: o,
+			})
+			pq.wakeupNextWorker()
+			return
+		}
+
 		// Mark the operation as completed.
 		delete(pq.inFlightDeduplicationMap, newInFlightDeduplicationKey(o.desiredState.ActionDigest))
 		o.executeResponse = executeResponse
