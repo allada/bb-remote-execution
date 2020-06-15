@@ -202,7 +202,7 @@ var _ builder.BuildQueue = (*InMemoryBuildQueue)(nil)
 var _ remoteworker.OperationQueueServer = (*InMemoryBuildQueue)(nil)
 var _ BuildQueueStateProvider = (*InMemoryBuildQueue)(nil)
 
-func shouldRetry(executeResponse *remoteexecution.ExecuteResponse) bool {
+func shouldRetry(executeResponse *remoteexecution.ExecuteResponse, workerKey workerKey) bool {
 	status := ""
 	if executeResponse.Status != nil {
 		status = executeResponse.Status.Message
@@ -212,7 +212,7 @@ func shouldRetry(executeResponse *remoteexecution.ExecuteResponse) bool {
 		exit_code = fmt.Sprint(executeResponse.Result.ExitCode)
 	}
 	// fmt.Println(executeResponse.Status.Message)
-	cmd := exec.Command("/home/ubuntu/should_retry.sh", exit_code, status, executeResponse.Message)
+	cmd := exec.Command("/home/ubuntu/should_retry.sh", exit_code, status, executeResponse.Message, string(workerKey))
 	if err := cmd.Run(); err != nil {
 		return true
 	}
@@ -517,7 +517,7 @@ func (bq *InMemoryBuildQueue) KillOperation(name string) bool {
 	}
 	o.complete(bq, &remoteexecution.ExecuteResponse{
 		Status: status.New(codes.Unavailable, "Operation was killed administratively").Proto(),
-	})
+	}, workerKey(""))
 	return true
 }
 
@@ -970,7 +970,7 @@ func (pq *platformQueue) removeStaleWorker(bq *InMemoryBuildQueue, workerKey wor
 	if o := w.getCurrentOperation(); o != nil {
 		o.complete(bq, &remoteexecution.ExecuteResponse{
 			Status: status.Newf(codes.Unavailable, "Worker %s disappeared while operation was executing", workerKey).Proto(),
-		})
+		}, workerKey)
 	}
 	delete(pq.workers, workerKey)
 	inMemoryBuildQueueWorkersRemovedTotal.WithLabelValues(pq.platformKey.instance, pq.platformKey.platform).Inc()
@@ -991,7 +991,7 @@ func (pq *platformQueue) remove(bq *InMemoryBuildQueue) {
 	for pq.queuedOperations.Len() > 0 {
 		pq.queuedOperations[pq.queuedOperations.Len()-1].operation.complete(bq, &remoteexecution.ExecuteResponse{
 			Status: status.New(codes.Unavailable, "Workers for this instance and platform disappeared while operation was queued").Proto(),
-		})
+		}, workerKey(""))
 	}
 	delete(bq.platformQueues, pq.platformKey)
 }
@@ -1194,7 +1194,7 @@ func (o *operation) waitExecution(bq *InMemoryBuildQueue, out remoteexecution.Ex
 // complete execution of the operation by registering the execution
 // response. This function wakes up any clients waiting on the operation
 // to complete.
-func (o *operation) complete(bq *InMemoryBuildQueue, executeResponse *remoteexecution.ExecuteResponse) {
+func (o *operation) complete(bq *InMemoryBuildQueue, executeResponse *remoteexecution.ExecuteResponse, workerKey workerKey) {
 	// Move the operation to the executing stage if it's still in
 	// the queued stage.
 	pq := o.platformQueue
@@ -1207,7 +1207,7 @@ func (o *operation) complete(bq *InMemoryBuildQueue, executeResponse *remoteexec
 	// Move the operation to the completed stage if it's still in
 	// the executing stage.
 	if o.executeResponse == nil {
-		if shouldRetry(executeResponse) && o.retryCount <= bq.configuration.WorkerOperationRetryCount {
+		if shouldRetry(executeResponse, workerKey) && o.retryCount <= bq.configuration.WorkerOperationRetryCount {
 			o.retryCount++
 			heap.Push(&pq.queuedOperations, queuedOperationsEntry{
 				priority:  math.MaxInt32,
@@ -1249,7 +1249,7 @@ func (o *operation) complete(bq *InMemoryBuildQueue, executeResponse *remoteexec
 func (o *operation) remove(bq *InMemoryBuildQueue) {
 	o.complete(bq, &remoteexecution.ExecuteResponse{
 		Status: status.New(codes.Canceled, "Operation no longer has any waiting clients").Proto(),
-	})
+	}, workerKey(""))
 
 	// Remove the operation.
 	delete(bq.operationsNameMap, o.name)
@@ -1382,7 +1382,7 @@ func (w *worker) getCurrentOrNextOperation(ctx context.Context, bq *InMemoryBuil
 					"Attempted to execute operation %d times, but it never completed. This operation may cause worker %s to crash.",
 					o.retryCount+1,
 					newWorkerKey(workerID)).Proto(),
-			})
+			}, newWorkerKey(workerID))
 		} else {
 			o.retryCount++
 			return &remoteworker.SynchronizeResponse{
@@ -1430,7 +1430,7 @@ func (w *worker) completeOperation(ctx context.Context, bq *InMemoryBuildQueue, 
 	if !w.isRunningCorrectOperation(actionDigest) {
 		return w.getCurrentOrNextOperation(ctx, bq, pq, workerID)
 	}
-	w.getCurrentOperation().complete(bq, executeResponse)
+	w.getCurrentOperation().complete(bq, executeResponse, newWorkerKey(workerID))
 	return w.getNextOperation(ctx, bq, pq, workerID)
 }
 
