@@ -187,6 +187,14 @@ func (be *localBuildExecutor) Execute(ctx context.Context, filePool re_filesyste
 					be.maximumExecutionTimeout))
 			return response
 		}
+		// We increase the timeout to give a little extra time because inside the runner_wrapper.sh
+		// file we will manage the timeout. We do this because it will give better timeout error messages and
+		// allows us to do things like download the docker container, sync disk and other prep work before the
+		// test is executed and this 'meta' work won't be counted against the test timeout duration.
+		executionTimeout = executionTimeout + (time.Duration(20) * time.Minute)
+		if executionTimeout > be.maximumExecutionTimeout {
+			executionTimeout = be.maximumExecutionTimeout
+		}
 	}
 
 	// Obtain build directory.
